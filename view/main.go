@@ -25,20 +25,29 @@ func MainView(window fyne.Window, containers []model.Container) fyne.CanvasObjec
 	}
 
 	v := &mainView{
-		all: containers,
+		localAll: containers,
 	}
-	v.filtered = append([]model.Container(nil), containers...)
+	v.localFiltered = append([]model.Container(nil), v.localAll...)
 
-	return v.build()
+	root := v.build()
+
+	// Load the remote section in the background so startup is not blocked.
+	v.startRemoteLoad()
+
+	return root
 }
 
 // mainView holds the mutable UI state.
 type mainView struct {
-	all      []model.Container
-	filtered []model.Container
-	selected *model.Container
+	remoteAll      []model.Container
+	localAll       []model.Container
+	remoteFiltered []model.Container
+	localFiltered  []model.Container
+	selected       *model.Container
+	selectedNodeID string
+	remoteLoading  bool
 
-	list        *widget.List
+	tree        *widget.Tree
 	searchEntry *widget.Entry
 	statusLabel *widget.Label
 	leftPanel   *fyne.Container
@@ -89,21 +98,66 @@ func (v *mainView) buildLeft() fyne.CanvasObject {
 
 	searchRow := container.NewBorder(nil, nil, nil, refreshBtn, v.searchEntry)
 
-	v.list = widget.NewList(
-		func() int { return len(v.filtered) },
-		func() fyne.CanvasObject { return newBlindBoxItem() },
-		func(id widget.ListItemID, obj fyne.CanvasObject) {
-			obj.(*blindBoxItem).set(v.filtered[id])
+	// The list is split into two sections: remote (GitHub folder) and local
+	// (the data folder).
+	v.tree = widget.NewTree(
+		func(uid widget.TreeNodeID) []widget.TreeNodeID {
+			switch uid {
+			case "":
+				return []widget.TreeNodeID{"remote", "local"}
+			case "remote":
+				return v.sectionLeafIDs("remote")
+			case "local":
+				return v.sectionLeafIDs("local")
+			}
+			return nil
+		},
+		func(uid widget.TreeNodeID) bool {
+			return uid == "" || uid == "remote" || uid == "local"
+		},
+		func(branch bool) fyne.CanvasObject {
+			if branch {
+				return widget.NewLabelWithStyle("", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
+			}
+			return newBlindBoxItem()
+		},
+		func(uid widget.TreeNodeID, branch bool, obj fyne.CanvasObject) {
+			if branch {
+				label := obj.(*widget.Label)
+				switch uid {
+				case "remote":
+					switch {
+					case v.remoteLoading:
+						label.SetText("远程（加载中…）")
+					default:
+						label.SetText(fmt.Sprintf("远程（%d）", len(v.remoteFiltered)))
+					}
+				case "local":
+					label.SetText(fmt.Sprintf("本地（%d）", len(v.localFiltered)))
+				}
+				return
+			}
+			if c, ok := v.containerFor(uid); ok {
+				obj.(*blindBoxItem).set(*c)
+			}
 		},
 	)
-	v.list.OnSelected = v.selectContainer
+	v.tree.HideSeparators = true
+	v.tree.OnSelected = func(uid widget.TreeNodeID) {
+		if uid == "remote" || uid == "local" {
+			v.tree.Unselect(uid)
+			return
+		}
+		v.selectContainer(uid)
+	}
+	v.tree.OpenAllBranches()
 
 	v.statusLabel = widget.NewLabel("")
 	v.statusLabel.Wrapping = fyne.TextWrapWord
 	v.statusLabel.Hide()
 
 	top := container.NewVBox(header, searchRow)
-	v.leftPanel = container.NewBorder(top, v.statusLabel, nil, nil, v.list)
+	v.leftPanel = container.NewBorder(top, v.statusLabel, nil, nil, v.tree)
 	return v.leftPanel
 }
 
@@ -153,69 +207,137 @@ func (v *mainView) buildRight() fyne.CanvasObject {
 	return container.NewVScroll(right)
 }
 
-// applyFilter filters the list by name or id and keeps the selection in sync.
+// applyFilter filters both sections by name or id and keeps the selection in sync.
 func (v *mainView) applyFilter(text string) {
 	query := strings.ToLower(strings.TrimSpace(text))
 
-	if query == "" {
-		v.filtered = append([]model.Container(nil), v.all...)
-	} else {
-		filtered := make([]model.Container, 0, len(v.all))
-		for _, c := range v.all {
-			if strings.Contains(strings.ToLower(c.Manifest.Name), query) ||
-				strings.Contains(strings.ToLower(c.Manifest.ID), query) {
-				filtered = append(filtered, c)
-			}
-		}
-		v.filtered = filtered
-	}
+	v.remoteFiltered = filterContainers(v.remoteAll, query)
+	v.localFiltered = filterContainers(v.localAll, query)
 
-	// Re-resolve the current selection against the filtered list.
+	// Re-resolve the current selection against the filtered lists.
 	keep := (*model.Container)(nil)
-	keepIndex := -1
+	keepID := ""
 	if v.selected != nil {
-		for i := range v.filtered {
-			if v.filtered[i].Manifest.ID == v.selected.Manifest.ID {
-				c := v.filtered[i]
-				keep = &c
-				keepIndex = i
-				break
-			}
+		if c, ok := v.containerFor(v.selectedNodeID); ok {
+			keep = c
+			keepID = v.selectedNodeID
 		}
 	}
 	v.selected = keep
-
-	// Synchronise the list's own selection state. Without this, an item that
-	// was filtered out and later returned at the same index could not be
-	// selected again, because List.Select early-returns on the stale id.
-	v.list.UnselectAll()
-	if keepIndex >= 0 {
-		v.list.Select(keepIndex)
+	if keep == nil {
+		v.selectedNodeID = ""
 	}
-	v.list.Refresh()
+
+	// Synchronise the tree's selection state. Without this, an item that was
+	// filtered out and later returned at the same id could not be selected
+	// again, because Tree.Select early-returns on the stale id.
+	v.tree.UnselectAll()
+	if keepID != "" {
+		v.tree.Select(keepID)
+	}
+	v.tree.Refresh()
 
 	v.applySelection()
 }
 
-// refresh reloads data from disk so newly added blind boxes show up.
-func (v *mainView) refresh() {
-	containers, err := model.LoadDataDefault()
-	if err != nil {
-		v.setStatus(fmt.Sprintf("刷新失败：%v", err))
-		return
+// filterContainers returns the containers matching the query by name or id.
+func filterContainers(containers []model.Container, query string) []model.Container {
+	if query == "" {
+		return append([]model.Container(nil), containers...)
 	}
-	v.setStatus("")
-	v.all = containers
+
+	filtered := make([]model.Container, 0, len(containers))
+	for _, c := range containers {
+		if strings.Contains(strings.ToLower(c.Manifest.Name), query) ||
+			strings.Contains(strings.ToLower(c.Manifest.ID), query) {
+			filtered = append(filtered, c)
+		}
+	}
+	return filtered
+}
+
+// sectionLeafIDs returns the tree leaf node ids of a section ("remote"/"local").
+func (v *mainView) sectionLeafIDs(section string) []widget.TreeNodeID {
+	list := v.remoteFiltered
+	if section == "local" {
+		list = v.localFiltered
+	}
+
+	ids := make([]widget.TreeNodeID, len(list))
+	for i, c := range list {
+		ids[i] = widget.TreeNodeID(section + ":" + c.Manifest.ID)
+	}
+	return ids
+}
+
+// containerFor resolves a tree leaf node id to its container.
+func (v *mainView) containerFor(nodeID string) (*model.Container, bool) {
+	section, id, ok := strings.Cut(nodeID, ":")
+	if !ok {
+		return nil, false
+	}
+
+	var list []model.Container
+	switch section {
+	case "remote":
+		list = v.remoteFiltered
+	case "local":
+		list = v.localFiltered
+	default:
+		return nil, false
+	}
+
+	for i := range list {
+		if list[i].Manifest.ID == id {
+			return &list[i], true
+		}
+	}
+	return nil, false
+}
+
+// refresh reloads local and remote data so newly added blind boxes show up.
+func (v *mainView) refresh() {
+	var status string
+
+	if local, err := model.LoadDataDefault(); err != nil {
+		status = fmt.Sprintf("本地加载失败：%v", err)
+	} else {
+		v.localAll = local
+	}
+
+	v.setStatus(status)
 	v.applyFilter(v.searchEntry.Text)
+	v.startRemoteLoad()
+}
+
+// startRemoteLoad begins fetching the remote section in the background.
+func (v *mainView) startRemoteLoad() {
+	v.remoteLoading = true
+	v.tree.Refresh()
+
+	go func() {
+		containers, err := LoadRemoteContainers(remoteBaseURL)
+
+		fyne.Do(func() {
+			v.remoteLoading = false
+			if err != nil {
+				v.setStatus(fmt.Sprintf("远程加载失败：%v", err))
+				return
+			}
+			v.remoteAll = containers
+			v.applyFilter(v.searchEntry.Text)
+		})
+	}()
 }
 
 // selectContainer stores the chosen blind box and rebuilds the right panel.
-func (v *mainView) selectContainer(id widget.ListItemID) {
-	if id < 0 || id >= len(v.filtered) {
+func (v *mainView) selectContainer(nodeID widget.TreeNodeID) {
+	c, ok := v.containerFor(nodeID)
+	if !ok {
 		return
 	}
-	c := v.filtered[id]
-	v.selected = &c
+	v.selected = c
+	v.selectedNodeID = nodeID
 	v.applySelection()
 }
 
