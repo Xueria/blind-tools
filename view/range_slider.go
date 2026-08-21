@@ -39,6 +39,8 @@ type RangeSlider struct {
 	disabled bool
 	active   int // thumb controlled by keyboard: 0 = lower, 1 = upper
 	dragging int // thumb being dragged: -1 = none, 0 = lower, 1 = upper
+
+	hoveredThumb int // thumb under the pointer: -1 = none, 0 = lower, 1 = upper
 }
 
 // NewRangeSlider creates a RangeSlider with the given bounds.
@@ -200,20 +202,32 @@ func (s *RangeSlider) FocusLost() {
 	}
 }
 
-// MouseIn marks the widget hovered.
-func (s *RangeSlider) MouseIn(_ *desktop.MouseEvent) {
+// MouseIn marks the widget hovered and picks the thumb under the pointer.
+func (s *RangeSlider) MouseIn(e *desktop.MouseEvent) {
 	s.hovered = true
+	s.hoveredThumb = s.nearestThumb(e.Position.X)
 	if !s.disabled {
 		s.Refresh()
 	}
 }
 
-// MouseMoved is a no-op hook for the hover interface.
-func (s *RangeSlider) MouseMoved(_ *desktop.MouseEvent) {}
+// MouseMoved keeps the hover indicator glued to whichever thumb is closest to
+// the pointer.
+func (s *RangeSlider) MouseMoved(e *desktop.MouseEvent) {
+	if s.disabled {
+		return
+	}
+	thumb := s.nearestThumb(e.Position.X)
+	if thumb != s.hoveredThumb {
+		s.hoveredThumb = thumb
+		s.Refresh()
+	}
+}
 
 // MouseOut clears the hovered flag.
 func (s *RangeSlider) MouseOut() {
 	s.hovered = false
+	s.hoveredThumb = -1
 	if !s.disabled {
 		s.Refresh()
 	}
@@ -425,15 +439,20 @@ func (r *rangeSliderRenderer) Layout(size fyne.Size) {
 	r.upperThumb.Move(fyne.NewPos(upperPos-diameter/2, thumbY))
 	r.upperThumb.Resize(fyne.NewSize(diameter, diameter))
 
-	// Focus indicator follows the active thumb
+	// Focus indicator follows the hovered thumb, falling back to the active
+	// (keyboard) thumb when not hovering.
+	thumb := r.slider.active
+	if r.slider.hovered && r.slider.hoveredThumb >= 0 {
+		thumb = r.slider.hoveredThumb
+	}
 	focusX := lowerPos
-	if r.slider.active == 1 {
+	if thumb == 1 {
 		focusX = upperPos
 	}
 	focusSize := fyne.NewSquareSize(inlineIconSize + th.Size(theme.SizeNameInnerPadding))
 	delta := (focusSize.Width - diameter) / 2
 	r.focusIndicator.Resize(focusSize)
-	r.focusIndicator.Move(fyne.NewPos(focusX-focusSize.Width/2+delta, thumbY-delta))
+	r.focusIndicator.Move(fyne.NewPos(focusX-focusSize.Width/2, thumbY-delta))
 }
 
 // MinSize calculates the minimum size of the widget.
