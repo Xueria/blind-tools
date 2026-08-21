@@ -85,8 +85,13 @@ func LoadData(directory string) ([]Container, error) {
 			container.Currencies = globalCurrency
 		}
 
-		if err := ValidateManifest(container); err != nil {
-			log.Printf("skip container %s: %v", containerDirectory, err)
+		if err := ValidateManifestPrices(container); err != nil {
+			log.Printf("skip container: %v", err)
+			continue
+		}
+
+		if err := ValidateManifestDraws(container); err != nil {
+			log.Printf("skip container: %v", err)
 			continue
 		}
 

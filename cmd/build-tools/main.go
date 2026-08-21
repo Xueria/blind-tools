@@ -3,6 +3,7 @@ package main
 import (
 	"blind-tools/model"
 	"blind-tools/res"
+	"blind-tools/view"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
@@ -48,5 +49,6 @@ func mainWindow() {
 	window := application.NewWindow(WindowTitle)
 
 	window.Resize(fyne.NewSize(Width, Height))
+	window.SetContent(view.MainView(window, data))
 	window.ShowAndRun()
 }

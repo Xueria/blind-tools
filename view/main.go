@@ -1,5 +1,494 @@
 package view
 
-func MainView() {
+import (
+	"blind-tools/model"
+	"errors"
+	"fmt"
+	"image/color"
+	"strconv"
+	"strings"
 
+	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/canvas"
+	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/layout"
+	"fyne.io/fyne/v2/theme"
+	"fyne.io/fyne/v2/widget"
+)
+
+// MainView assembles the application UI: a blind box list on the left and a
+// resource planning panel on the right.
+func MainView(window fyne.Window, containers []model.Container) fyne.CanvasObject {
+	// Apply the Material Design 3 theme for the whole app.
+	if a := fyne.CurrentApp(); a != nil {
+		a.Settings().SetTheme(NewMD3Theme())
+	}
+
+	v := &mainView{
+		all: containers,
+	}
+	v.filtered = append([]model.Container(nil), containers...)
+
+	return v.build()
+}
+
+// mainView holds the mutable UI state.
+type mainView struct {
+	all      []model.Container
+	filtered []model.Container
+	selected *model.Container
+
+	list        *widget.List
+	searchEntry *widget.Entry
+	statusLabel *widget.Label
+	leftPanel   *fyne.Container
+
+	formCard        *widget.Card
+	currencyEntries []*widget.Entry
+	keepSelect      *widget.Select
+	rangeSlider     *RangeSlider
+	rangeLabel      *widget.Label
+	calculateBtn    *widget.Button
+
+	resultBox    *fyne.Container
+	summaryLabel *widget.Label
+
+	plan     []planStep
+	fail     bool
+	failDraw int
+}
+
+// build constructs the full split layout once.
+func (v *mainView) build() fyne.CanvasObject {
+	left := v.buildLeft()
+	right := v.buildRight()
+
+	// Add a gutter on the inner sides so the two panels read as separate
+	// surfaces instead of one merged panel.
+	left = container.New(layout.NewCustomPaddedLayout(0, 0, 0, 8), left)
+	right = container.New(layout.NewCustomPaddedLayout(0, 0, 8, 0), right)
+
+	split := container.NewHSplit(left, right)
+	split.Offset = 0.32
+
+	v.applySelection()
+
+	return split
+}
+
+// buildLeft creates the search bar, refresh button and blind box list.
+func (v *mainView) buildLeft() fyne.CanvasObject {
+	header := widget.NewLabelWithStyle("盲盒列表", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
+
+	v.searchEntry = widget.NewEntry()
+	v.searchEntry.SetPlaceHolder("搜索盲盒名称…")
+	v.searchEntry.OnChanged = v.applyFilter
+
+	refreshBtn := widget.NewButtonWithIcon("刷新", theme.ViewRefreshIcon(), v.refresh)
+	refreshBtn.Importance = widget.MediumImportance
+
+	searchRow := container.NewBorder(nil, nil, nil, refreshBtn, v.searchEntry)
+
+	v.list = widget.NewList(
+		func() int { return len(v.filtered) },
+		func() fyne.CanvasObject { return newBlindBoxItem() },
+		func(id widget.ListItemID, obj fyne.CanvasObject) {
+			obj.(*blindBoxItem).set(v.filtered[id])
+		},
+	)
+	v.list.OnSelected = v.selectContainer
+
+	v.statusLabel = widget.NewLabel("")
+	v.statusLabel.Wrapping = fyne.TextWrapWord
+	v.statusLabel.Hide()
+
+	top := container.NewVBox(header, searchRow)
+	v.leftPanel = container.NewBorder(top, v.statusLabel, nil, nil, v.list)
+	return v.leftPanel
+}
+
+// setStatus shows a transient message at the bottom of the left panel, or
+// hides it (and reclaims the space) when the message is empty.
+func (v *mainView) setStatus(text string) {
+	if text == "" {
+		v.statusLabel.SetText("")
+		v.statusLabel.Hide()
+	} else {
+		v.statusLabel.SetText(text)
+		v.statusLabel.Show()
+	}
+	if v.leftPanel != nil {
+		v.leftPanel.Refresh()
+	}
+}
+
+// buildRight creates the resource form and the result table.
+func (v *mainView) buildRight() fyne.CanvasObject {
+	v.formCard = widget.NewCard("", "", nil)
+
+	v.keepSelect = widget.NewSelect(nil, nil)
+
+	v.rangeSlider = NewRangeSlider(1, 1)
+	v.rangeSlider.Step = 1
+	v.rangeSlider.OnChanged = func(lower, upper float64) {
+		v.rangeLabel.SetText(fmt.Sprintf("第 %d 抽 ～ 第 %d 抽", int(lower), int(upper)))
+	}
+
+	v.rangeLabel = widget.NewLabel("")
+
+	v.calculateBtn = widget.NewButton("计算方案", v.calculate)
+	v.calculateBtn.Importance = widget.HighImportance
+
+	v.summaryLabel = widget.NewLabel("")
+	v.summaryLabel.Wrapping = fyne.TextWrapWord
+
+	v.resultBox = container.NewVBox()
+
+	resultTitle := widget.NewLabelWithStyle("计算方案", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
+	resultArea := container.NewBorder(resultTitle, v.summaryLabel, nil, nil, v.resultBox)
+
+	right := container.NewBorder(v.formCard, nil, nil, nil, resultArea)
+	// Wrap the whole panel so its minimum height stays small and the window
+	// remains freely resizable; content scrolls when space is tight.
+	return container.NewVScroll(right)
+}
+
+// applyFilter filters the list by name or id and keeps the selection in sync.
+func (v *mainView) applyFilter(text string) {
+	query := strings.ToLower(strings.TrimSpace(text))
+
+	if query == "" {
+		v.filtered = append([]model.Container(nil), v.all...)
+	} else {
+		filtered := make([]model.Container, 0, len(v.all))
+		for _, c := range v.all {
+			if strings.Contains(strings.ToLower(c.Manifest.Name), query) ||
+				strings.Contains(strings.ToLower(c.Manifest.ID), query) {
+				filtered = append(filtered, c)
+			}
+		}
+		v.filtered = filtered
+	}
+
+	// Re-resolve the current selection against the filtered list.
+	keep := (*model.Container)(nil)
+	keepIndex := -1
+	if v.selected != nil {
+		for i := range v.filtered {
+			if v.filtered[i].Manifest.ID == v.selected.Manifest.ID {
+				c := v.filtered[i]
+				keep = &c
+				keepIndex = i
+				break
+			}
+		}
+	}
+	v.selected = keep
+
+	// Synchronise the list's own selection state. Without this, an item that
+	// was filtered out and later returned at the same index could not be
+	// selected again, because List.Select early-returns on the stale id.
+	v.list.UnselectAll()
+	if keepIndex >= 0 {
+		v.list.Select(keepIndex)
+	}
+	v.list.Refresh()
+
+	v.applySelection()
+}
+
+// refresh reloads data from disk so newly added blind boxes show up.
+func (v *mainView) refresh() {
+	containers, err := model.LoadDataDefault()
+	if err != nil {
+		v.setStatus(fmt.Sprintf("刷新失败：%v", err))
+		return
+	}
+	v.setStatus("")
+	v.all = containers
+	v.applyFilter(v.searchEntry.Text)
+}
+
+// selectContainer stores the chosen blind box and rebuilds the right panel.
+func (v *mainView) selectContainer(id widget.ListItemID) {
+	if id < 0 || id >= len(v.filtered) {
+		return
+	}
+	c := v.filtered[id]
+	v.selected = &c
+	v.applySelection()
+}
+
+// applySelection rebuilds the right panel to match the current selection.
+func (v *mainView) applySelection() {
+	v.plan = nil
+	v.fail = false
+	v.failDraw = 0
+	v.currencyEntries = nil
+	v.rebuildResultTable()
+
+	if v.selected == nil {
+		v.formCard.SetTitle("资源规划")
+		v.formCard.SetSubTitle("请选择一个盲盒")
+		v.formCard.SetContent(container.NewCenter(widget.NewLabel("从左侧列表选择一个盲盒开始规划")))
+		v.keepSelect.Disable()
+		v.rangeSlider.Disable()
+		v.calculateBtn.Disable()
+		v.summaryLabel.SetText("")
+		return
+	}
+
+	c := v.selected
+	v.formCard.SetTitle(c.Manifest.Name)
+	v.formCard.SetSubTitle(fmt.Sprintf("共 %d 抽 · %d 种资源", c.Manifest.Draws, len(c.Currencies)))
+
+	// Currency quantity inputs.
+	form := widget.NewForm()
+	for _, currency := range c.Currencies {
+		entry := widget.NewEntry()
+		entry.SetPlaceHolder("0")
+		entry.Validator = numericValidator
+		// Don't capture the mouse wheel: keep the panel scrollable over inputs.
+		entry.Wrapping = fyne.TextWrapOff
+		entry.Scroll = fyne.ScrollNone
+		form.Append(currency.Name, entry)
+		v.currencyEntries = append(v.currencyEntries, entry)
+	}
+
+	currencyTitle := widget.NewLabelWithStyle("资源数量", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
+	rangeTitle := widget.NewLabelWithStyle("抽数范围", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
+	keepTitle := widget.NewLabelWithStyle("优先保留的资源", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
+
+	// Draw range slider.
+	draws := c.Manifest.Draws
+	if draws < 1 {
+		draws = 1
+	}
+	v.rangeSlider.SetRange(1, float64(draws))
+	v.rangeSlider.SetValues(1, float64(draws))
+	v.rangeLabel.SetText(fmt.Sprintf("第 1 抽 ～ 第 %d 抽", draws))
+	if draws <= 1 {
+		v.rangeSlider.Disable()
+	} else {
+		v.rangeSlider.Enable()
+	}
+
+	// Preferred currency selector.
+	names := make([]string, 0, len(c.Currencies))
+	for _, currency := range c.Currencies {
+		names = append(names, currency.Name)
+	}
+	v.keepSelect.SetOptions(names)
+	if len(names) > 0 {
+		v.keepSelect.SetSelectedIndex(0)
+	}
+	v.keepSelect.Enable()
+
+	v.calculateBtn.Enable()
+	v.summaryLabel.SetText("填写资源数量后点击「计算方案」")
+
+	content := container.NewVBox(
+		currencyTitle,
+		form,
+		rangeTitle,
+		v.rangeSlider,
+		v.rangeLabel,
+		keepTitle,
+		v.keepSelect,
+		v.calculateBtn,
+	)
+	v.formCard.SetContent(content)
+}
+
+// calculate parses inputs, runs the plan and updates the table.
+func (v *mainView) calculate() {
+	if v.selected == nil {
+		return
+	}
+
+	balances := make(map[string]int, len(v.selected.Currencies))
+	for i, currency := range v.selected.Currencies {
+		text := strings.TrimSpace(v.currencyEntries[i].Text)
+		if text == "" {
+			text = "0"
+		}
+		amount, err := strconv.Atoi(text)
+		if err != nil || amount < 0 {
+			v.summaryLabel.SetText(fmt.Sprintf("请输入有效的「%s」数量", currency.Name))
+			return
+		}
+		balances[currency.ID] = amount
+	}
+
+	start := int(v.rangeSlider.Lower)
+	end := int(v.rangeSlider.Upper)
+	if start < 1 {
+		start = 1
+	}
+	if end < start {
+		end = start
+	}
+
+	result := calculatePlan(*v.selected, start, end, balances, v.preferKeepID())
+
+	v.plan = result.Steps
+	v.fail = result.Insufficient
+	v.failDraw = result.FailAtDraw
+	v.rebuildResultTable()
+	v.updateSummary(result)
+}
+
+// preferKeepID resolves the selected "keep more" currency id.
+func (v *mainView) preferKeepID() string {
+	idx := v.keepSelect.SelectedIndex()
+	if idx >= 0 && idx < len(v.selected.Currencies) {
+		return v.selected.Currencies[idx].ID
+	}
+	return ""
+}
+
+// updateSummary renders final balances and any insufficiency notice.
+func (v *mainView) updateSummary(result planResult) {
+	parts := make([]string, 0, len(result.Final))
+	for _, id := range sortedCurrencyIDs(*v.selected) {
+		parts = append(parts, fmt.Sprintf("%s %d", currencyName(*v.selected, id), result.Final[id]))
+	}
+	summary := "剩余资源：" + strings.Join(parts, "，")
+	if result.Insufficient {
+		summary = fmt.Sprintf("第 %d 抽资源不足，无法继续｜", result.FailAtDraw) + summary
+	}
+	v.summaryLabel.SetText(summary)
+}
+
+// rebuildResultTable redraws the result as a simple grid that grows to its full
+// height. Unlike a widget.Table (which scrolls internally and collapses to a
+// single visible row in a small window), this grid lets the outer scroll reveal
+// every row at once.
+func (v *mainView) rebuildResultTable() {
+	rows := []fyne.CanvasObject{
+		container.NewGridWithColumns(4,
+			resultCell("抽数", true),
+			resultCell("使用资源", true),
+			resultCell("花费", true),
+			resultCell("剩余", true),
+		),
+		widget.NewSeparator(),
+	}
+
+	for _, step := range v.plan {
+		rows = append(rows, container.NewGridWithColumns(4,
+			resultCell(strconv.Itoa(step.Draw), false),
+			resultCell(step.CurrencyName, false),
+			resultCell(strconv.Itoa(step.Cost), false),
+			resultCell(strconv.Itoa(step.Remaining), false),
+		))
+	}
+
+	if v.fail {
+		rows = append(rows, container.NewGridWithColumns(4,
+			resultCell(strconv.Itoa(v.failDraw), false),
+			resultCell("资源不足", false),
+			resultCell("—", false),
+			resultCell("—", false),
+		))
+	}
+
+	v.resultBox.Objects = rows
+	v.resultBox.Refresh()
+}
+
+// resultCell builds a centred label cell for the result grid.
+func resultCell(text string, bold bool) fyne.CanvasObject {
+	return widget.NewLabelWithStyle(text, fyne.TextAlignCenter, fyne.TextStyle{Bold: bold})
+}
+
+// numericValidator accepts empty strings and non-negative integers.
+func numericValidator(text string) error {
+	if text == "" {
+		return nil
+	}
+	for _, r := range text {
+		if r < '0' || r > '9' {
+			return errors.New("只能输入数字")
+		}
+	}
+	return nil
+}
+
+// blindBoxItem is a single row in the blind box list.
+type blindBoxItem struct {
+	widget.BaseWidget
+
+	title    string
+	subtitle string
+}
+
+func newBlindBoxItem() fyne.CanvasObject {
+	item := &blindBoxItem{}
+	item.ExtendBaseWidget(item)
+	return item
+}
+
+func (b *blindBoxItem) set(c model.Container) {
+	b.title = c.Manifest.Name
+	b.subtitle = fmt.Sprintf("%d 抽 · %d 种资源", c.Manifest.Draws, len(c.Currencies))
+	b.Refresh()
+}
+
+// MinSize returns the minimum size of the item.
+func (b *blindBoxItem) MinSize() fyne.Size {
+	b.ExtendBaseWidget(b)
+	return b.BaseWidget.MinSize()
+}
+
+// CreateRenderer creates the canvas objects for the item.
+func (b *blindBoxItem) CreateRenderer() fyne.WidgetRenderer {
+	title := canvas.NewText(b.title, color.White)
+	title.TextStyle = fyne.TextStyle{Bold: true}
+	subtitle := canvas.NewText(b.subtitle, color.White)
+
+	r := &blindBoxItemRenderer{
+		baseRenderer: baseRenderer{objects: []fyne.CanvasObject{title, subtitle}},
+		title:        title,
+		subtitle:     subtitle,
+		item:         b,
+	}
+	r.Refresh()
+	return r
+}
+
+type blindBoxItemRenderer struct {
+	baseRenderer
+
+	title    *canvas.Text
+	subtitle *canvas.Text
+	item     *blindBoxItem
+}
+
+func (r *blindBoxItemRenderer) Refresh() {
+	th := r.item.Theme()
+	v := fyne.CurrentApp().Settings().ThemeVariant()
+
+	r.title.Text = r.item.title
+	r.title.Color = th.Color(theme.ColorNameForeground, v)
+	r.subtitle.Text = r.item.subtitle
+	r.subtitle.Color = th.Color(theme.ColorNamePlaceHolder, v)
+
+	canvas.Refresh(r.item)
+}
+
+func (r *blindBoxItemRenderer) Layout(size fyne.Size) {
+	pad := r.item.Theme().Size(theme.SizeNamePadding)
+	titleHeight := r.title.MinSize().Height
+
+	r.title.Move(fyne.NewPos(pad, pad))
+	r.title.Resize(fyne.NewSize(size.Width-pad*2, titleHeight))
+	r.subtitle.Move(fyne.NewPos(pad, pad+titleHeight))
+	r.subtitle.Resize(fyne.NewSize(size.Width-pad*2, r.subtitle.MinSize().Height))
+}
+
+func (r *blindBoxItemRenderer) MinSize() fyne.Size {
+	pad := r.item.Theme().Size(theme.SizeNamePadding)
+	height := r.title.MinSize().Height + r.subtitle.MinSize().Height + pad*3
+	return fyne.NewSize(r.title.MinSize().Width+pad*2, height)
 }
