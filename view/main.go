@@ -395,15 +395,15 @@ func (v *mainView) applySelection() {
 		v.rangeSlider.Enable()
 	}
 
-	// Preferred currency selector.
-	names := make([]string, 0, len(c.Currencies))
+	// Preferred currency selector. The first option "无" means no preference
+	// (just maximise the number of draws).
+	names := make([]string, 0, len(c.Currencies)+1)
+	names = append(names, "无")
 	for _, currency := range c.Currencies {
 		names = append(names, currency.Name)
 	}
 	v.keepSelect.SetOptions(names)
-	if len(names) > 0 {
-		v.keepSelect.SetSelectedIndex(0)
-	}
+	v.keepSelect.SetSelectedIndex(0)
 	v.keepSelect.Enable()
 
 	v.calculateBtn.Enable()
@@ -463,8 +463,12 @@ func (v *mainView) calculate() {
 // preferKeepID resolves the selected "keep more" currency id.
 func (v *mainView) preferKeepID() string {
 	idx := v.keepSelect.SelectedIndex()
-	if idx >= 0 && idx < len(v.selected.Currencies) {
-		return v.selected.Currencies[idx].ID
+	if idx <= 0 { // "无" (or no selection) means no preference
+		return ""
+	}
+	i := idx - 1
+	if i < len(v.selected.Currencies) {
+		return v.selected.Currencies[i].ID
 	}
 	return ""
 }

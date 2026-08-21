@@ -3,6 +3,7 @@ package view
 import (
 	"blind-tools/model"
 	"maps"
+	"math"
 	"sort"
 )
 
@@ -23,64 +24,163 @@ type planResult struct {
 	FailAtDraw   int
 }
 
-// calculatePlan computes, for every draw in the inclusive range [start, end],
-// which currency to spend so that the preferred currency (preferKeep) is used
-// as little as possible. Non-preferred currencies are spent first (in the order
-// they appear in the container), and the preferred currency is only spent when
-// no other currency can cover the draw.
+// calculatePlan computes the optimal spending plan for the inclusive draw
+// range [start, end], using the following lexicographic objective:
+//
+//  1. maximise the number of completed draws;
+//  2. minimise spending of the preferred currency (when preferKeep != "");
+//  3. minimise the imbalance between the remaining fractions of each currency.
+//
+// Because the number of draws is small, it enumerates every currency assignment
+// (each draw independently chooses one of its accepted currencies) and keeps
+// the best one, which is guaranteed to be optimal.
 func calculatePlan(container model.Container, start, end int, balances map[string]int, preferKeep string) planResult {
 	costs := buildCostLookup(container)
-	order := buildSpendOrder(container, preferKeep)
+	order := currencyOrder(container)
 
-	res := planResult{
-		Final: make(map[string]int, len(balances)),
+	// Effective draws: only those with at least one payment option. A draw with
+	// no option (missing/empty price) cannot be paid, so the plan stops before it.
+	var draws []int
+	hardFail := 0
+	for d := start; d <= end; d++ {
+		if len(costs[d]) == 0 {
+			hardFail = d
+			break
+		}
+		draws = append(draws, d)
 	}
 
+	res := planResult{Final: make(map[string]int, len(balances))}
 	maps.Copy(res.Final, balances)
 
-	for draw := start; draw <= end; draw++ {
-		cost, ok := costs[draw]
-		if !ok {
-			res.Insufficient = true
-			res.FailAtDraw = draw
-			return res
-		}
+	if len(draws) == 0 {
+		res.Insufficient = true
+		res.FailAtDraw = start
+		return res
+	}
 
-		chosen := ""
-		for _, id := range order {
-			amount, ok := cost[id]
-			if !ok {
-				continue // this draw does not accept this currency
-			}
-			if res.Final[id] >= amount {
-				chosen = id
-				break
-			}
-		}
-		if chosen == "" {
-			res.Insufficient = true
-			res.FailAtDraw = draw
-			return res
-		}
+	best := candidate{completed: -1}
+	bestChoices := make([]string, len(draws))
+	choices := make([]string, len(draws))
 
-		res.Final[chosen] -= cost[chosen]
+	var search func(idx int)
+	search = func(idx int) {
+		if idx == len(draws) {
+			c := evaluateCandidate(draws, choices, costs, balances, preferKeep)
+			if c.better(best) {
+				best = c
+				copy(bestChoices, choices)
+			}
+			return
+		}
+		for _, id := range drawCurrencies(draws[idx], costs, order) {
+			choices[idx] = id
+			search(idx + 1)
+		}
+	}
+	search(0)
+
+	// Rebuild the result from the best assignment.
+	for i := 0; i < best.completed && i < len(draws); i++ {
+		id := bestChoices[i]
+		cost := costs[draws[i]][id]
+		res.Final[id] -= cost
 		res.Steps = append(res.Steps, planStep{
-			Draw:         draw,
-			CurrencyID:   chosen,
-			CurrencyName: currencyName(container, chosen),
-			Cost:         cost[chosen],
-			Remaining:    res.Final[chosen],
+			Draw:         draws[i],
+			CurrencyID:   id,
+			CurrencyName: currencyName(container, id),
+			Cost:         cost,
+			Remaining:    res.Final[id],
 		})
 	}
 
+	if best.completed < len(draws) {
+		res.Insufficient = true
+		res.FailAtDraw = draws[best.completed]
+	} else if hardFail != 0 {
+		res.Insufficient = true
+		res.FailAtDraw = hardFail
+	}
+
 	return res
+}
+
+// candidate is the score of a single currency assignment.
+type candidate struct {
+	completed      int
+	preferredSpent int
+	imbalance      float64
+}
+
+// better reports whether c is a strictly better candidate than o, following the
+// objective order: more draws, then less preferred spend, then better balance.
+func (c candidate) better(o candidate) bool {
+	if c.completed != o.completed {
+		return c.completed > o.completed
+	}
+	if c.preferredSpent != o.preferredSpent {
+		return c.preferredSpent < o.preferredSpent
+	}
+	return c.imbalance < o.imbalance
+}
+
+// evaluateCandidate walks an assignment (choices[i] pays draws[i]) and returns
+// how many draws it completes before running out, plus its score.
+func evaluateCandidate(draws []int, choices []string, costs map[int]map[string]int, balances map[string]int, preferKeep string) candidate {
+	spent := make(map[string]int, len(balances))
+	completed := 0
+
+	for i, id := range choices {
+		cost := costs[draws[i]][id]
+		if spent[id]+cost > balances[id] {
+			break
+		}
+		spent[id] += cost
+		completed++
+	}
+
+	preferredSpent := 0
+	if preferKeep != "" {
+		preferredSpent = spent[preferKeep]
+	}
+
+	return candidate{
+		completed:      completed,
+		preferredSpent: preferredSpent,
+		imbalance:      imbalanceOf(balances, spent),
+	}
+}
+
+// imbalanceOf measures how unbalanced the leftover amounts are across all
+// currencies, as a value in [0, 1] (0 = all currencies left with the same
+// fraction of their original balance).
+func imbalanceOf(balances, spent map[string]int) float64 {
+	minFrac := math.MaxFloat64
+	maxFrac := -math.MaxFloat64
+
+	for id, bal := range balances {
+		if bal <= 0 {
+			continue
+		}
+		frac := float64(bal-spent[id]) / float64(bal)
+		if frac < minFrac {
+			minFrac = frac
+		}
+		if frac > maxFrac {
+			maxFrac = frac
+		}
+	}
+
+	if minFrac == math.MaxFloat64 {
+		return 0
+	}
+	return maxFrac - minFrac
 }
 
 // buildCostLookup maps a draw number (1 based) to its cost table.
 func buildCostLookup(container model.Container) map[int]map[string]int {
 	costs := make(map[int]map[string]int, len(container.Manifest.Prices))
 	for _, price := range container.Manifest.Prices {
-		// Copy so the caller can never mutate the source data.
 		table := make(map[string]int, len(price.Cost))
 		maps.Copy(table, price.Cost)
 		costs[price.Draw] = table
@@ -88,36 +188,38 @@ func buildCostLookup(container model.Container) map[int]map[string]int {
 	return costs
 }
 
-// buildSpendOrder returns currency IDs ordered by spending priority: every
-// non-preferred currency first (stable container order), then the preferred one
-// last. Cost table keys not present in the container currencies are included so
-// they are never ignored.
-func buildSpendOrder(container model.Container, preferKeep string) []string {
-	order := make([]string, 0, len(container.Currencies)+1)
+// currencyOrder returns every currency id in a deterministic order: the
+// declared container currencies first, then any cost-table keys that are not
+// declared currencies.
+func currencyOrder(container model.Container) []string {
 	seen := make(map[string]bool, len(container.Currencies)+1)
+	order := make([]string, 0, len(container.Currencies)+1)
 
 	for _, currency := range container.Currencies {
-		if currency.ID != preferKeep {
-			order = append(order, currency.ID)
-			seen[currency.ID] = true
-		}
+		order = append(order, currency.ID)
+		seen[currency.ID] = true
 	}
-
-	// Include any cost-table keys that are not declared currencies.
 	for _, price := range container.Manifest.Prices {
 		for id := range price.Cost {
-			if !seen[id] && id != preferKeep {
+			if !seen[id] {
 				order = append(order, id)
 				seen[id] = true
 			}
 		}
 	}
-
-	if preferKeep != "" {
-		order = append(order, preferKeep)
-	}
-
 	return order
+}
+
+// drawCurrencies returns the currencies accepted by a draw, in the given order.
+func drawCurrencies(draw int, costs map[int]map[string]int, order []string) []string {
+	table := costs[draw]
+	result := make([]string, 0, len(table))
+	for _, id := range order {
+		if _, ok := table[id]; ok {
+			result = append(result, id)
+		}
+	}
+	return result
 }
 
 // currencyName resolves a currency ID to its display name.
